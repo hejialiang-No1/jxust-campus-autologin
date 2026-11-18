@@ -1,6 +1,6 @@
 # JXUST-WLAN 校园网自动登录（Windows + macOS）
 
-> 仓库：<https://github.com/hejialiang-No1/jxust-campus-autologin>（私有）
+> 仓库：<https://github.com/hejialiang-No1/jxust-campus-autologin>（公开仓库，不含任何真实账号或密码）
 > Clone 或 Download ZIP 后，把文件夹放到一个**不会移动**的位置再按下面「快速开始」操作。
 > macOS 从 ZIP 解压后若双击 `.command` 被系统拦，先在终端执行 `chmod +x 首次配置.command`。
 
