@@ -1,0 +1,1034 @@
+#!/bin/bash
+# campus-autologin 1.0 — macOS 校园网 Portal 自动认证
+# 兼容 bash 3.2 (macOS 自带)，无第三方依赖。
+#
+# 子命令:
+#   probe        连上未认证校园网后，抓取 Portal 跳转与表单参数
+#   import-curl  导入浏览器 F12「复制为 cURL」的命令，自动生成配置
+#   set-cred     把账号写入配置、密码写入 macOS 钥匙串
+#   login        执行一次认证检测（在线则跳过；由 launchd 调用）
+#   install      安装/重载开机自启守护
+#   autostart    自检并自动修复开机自启的所有条件
+#   uninstall    卸载守护
+#   no-popup     弹窗抑制说明（macOS 27 老开关已失效，看下面）
+#   close-popup  立刻收掉已弹出的登录页窗口 / 浏览器标签页
+#   popup-on     恢复系统默认的老开关设置
+#   status       查看状态
+#   log          查看日志
+#   watch        前台常驻监听（launchd 不可用时的替代方案）
+#   edit         编辑配置
+
+export PATH=/usr/bin:/bin:/usr/sbin:/sbin:/usr/local/bin:/opt/homebrew/bin
+export LC_ALL=en_US.UTF-8
+
+BASE="$HOME/.config/campus-autologin"
+CONFIG="$BASE/config.env"
+IMPORTED="$BASE/imported.env"
+HEADERS_FILE="$BASE/headers.txt"
+PROBE_OUT="$BASE/probe.txt"
+QUERY_FILE="$BASE/query.txt"
+FIELDS_FILE="$BASE/fields.txt"
+JAR="$BASE/cookies.txt"
+STATE_DIR="$BASE/state"
+LAST_TRY="$STATE_DIR/last_try"
+FAIL_COUNT="$STATE_DIR/fail_count"
+# SSID 缓存：system_profiler 读一次要 2~3 秒，不能每次触发都跑
+SSID_CACHE="$STATE_DIR/ssid_cache"
+SSID_CACHE_TTL=600
+LOGDIR="$HOME/Library/Logs"
+LOG="$LOGDIR/campus-autologin.log"
+AGENT_LABEL="com.hejialiang.campus-autologin"
+PLIST="$HOME/Library/LaunchAgents/$AGENT_LABEL.plist"
+KC_SERVICE="campus-autologin"
+# macOS Captive Network Assistant（连 Wi-Fi 自动弹「网络登录页」）开关
+CNA_sys="/Library/Preferences/SystemConfiguration/com.apple.captive.control"
+CNA_user="$HOME/Library/Preferences/com.apple.captive.control"
+UA="Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/605.1.15 (KHTML, like Gecko) Version/17.0 Safari/605.1.15"
+case "$0" in
+  */*) SELF_PATH="$0" ;;
+  *)   SELF_PATH=$(command -v "$0" 2>/dev/null || printf '%s' "$0") ;;
+esac
+
+mkdir -p "$BASE" "$STATE_DIR" "$LOGDIR" "$HOME/Library/LaunchAgents" 2>/dev/null
+chmod 700 "$BASE" "$STATE_DIR" 2>/dev/null
+umask 077   # 配置/探测/cookie 文件一律仅本人可读写
+
+# ---------- 默认配置 ----------
+USERNAME=""
+ACCOUNT_SUFFIX=""
+SSID_MATCH=""
+LOGIN_URL=""
+LOGIN_METHOD="POST"
+POST_FIELDS=""
+SUCCESS_REGEX="success|已认证|认证成功|登录成功"
+CHECK_URL="http://captive.apple.com/hotspot-detect.html"
+ONLINE_REGEX="Success"
+OFFLINE_REGEX=""
+DEBOUNCE_SEC=25
+MAX_BACKOFF=300
+# 兜底检测周期（秒）：越小，掉线后恢复越快
+CHECK_INTERVAL=30
+# 极速通道：Wi-Fi 刚连上 / DHCP 未就绪时，在本轮内短轮询等网关，
+# 一通就立刻认证（跳过防抖），抢在 macOS 弹出登录页之前完成
+FAST_WAIT_SEC=15
+FAST_POLL_SEC=2
+# 日志超过该行数自动 gzip 归档，只留最近 3 份
+LOG_MAX_LINES=3000
+# 认证成功后是否顺带关掉浏览器里被 AC 跳转出来的 Portal 标签页。
+# 需要先手动跑一次 `campus-autologin close-popup` 并完成系统的自动化授权；
+# 没授权前开 1 会在后台弹授权框，所以默认关闭。
+CLOSE_BROWSER_TABS=0
+PREGET=1
+DYNAMIC_FIELDS="queryString,wlanuserip,userip,user_ip,nasip,nas_ip,wlanacname,wlanacip,ac_id,url,redirectUrl,wlanparameter"
+PASSWORD=""
+
+load_config() {
+  [ -f "$CONFIG" ] && . "$CONFIG"
+  [ -f "$IMPORTED" ] && . "$IMPORTED"   # import-curl 生成，优先级更高
+  PASSWORD=$(security find-generic-password -s "$KC_SERVICE" -w 2>/dev/null)
+  [ -z "$USERNAME" ] && USERNAME=$(security find-generic-password -s "$KC_SERVICE" 2>/dev/null | sed -n 's/.*"acct"<blob>="\([^"]*\)".*/\1/p')
+}
+
+log() {
+  local msg="$*"
+  [ -n "$PASSWORD" ] && msg="${msg//$PASSWORD/********}"
+  printf '%s  %s\n' "$(date '+%Y-%m-%d %H:%M:%S')" "$msg" >> "$LOG" 2>/dev/null
+  [ -t 1 ] && printf '%s\n' "$msg"
+}
+
+# 日志轮转：守护每 30 秒写一行，几个月能堆到几十万行。
+# 超过 LOG_MAX_LINES 就 gzip 归档，只保留最近 3 份。
+rotate_log() {
+  [ -f "$LOG" ] || return 0
+  local lines stamp f
+  lines=$(wc -l < "$LOG" 2>/dev/null | tr -d ' ')
+  case "$lines" in ''|*[!0-9]*) return 0 ;; esac
+  [ "$lines" -lt "$LOG_MAX_LINES" ] && return 0
+  stamp=$(date '+%Y%m%d-%H%M%S')
+  if gzip -c "$LOG" > "$LOGDIR/campus-autologin.$stamp.log.gz" 2>/dev/null; then
+    : > "$LOG"
+  fi
+  ls -1t "$LOGDIR"/campus-autologin.*.log.gz 2>/dev/null | tail -n +4 | \
+    while IFS= read -r f; do rm -f "$f"; done
+}
+
+now() { date +%s; }
+
+wifi_dev() {
+  networksetup -listallhardwareports 2>/dev/null | awk '/^Hardware Port: Wi-Fi/{getline; print $2; exit}'
+}
+
+# ---------- 绑定校园网 Wi-Fi 接口 ----------
+# 本机同时接了 iPhone USB 热点(en10)且默认路由指向它时，
+# 10.17.8.18 的 Portal 完全不可达（curl 超时），认证会静默失败。
+# 所有探测/认证请求一律绑定 Wi-Fi 设备，绕过默认路由的影响。
+# 注意：Wi-Fi 刚连上时 DHCP 还没发 IP，脚本启动那一刻可能绑不上接口，
+#       所以 portal_state_retry() 每轮轮询都会重新调用本函数刷新。
+refresh_iface() {
+  WIFI_DEV=$(wifi_dev)
+  IFACE_ARGS=()
+  [ -n "$WIFI_DEV" ] && [ -n "$(ipconfig getifaddr "$WIFI_DEV" 2>/dev/null)" ] && \
+    IFACE_ARGS=(--interface "$WIFI_DEV")
+}
+refresh_iface
+
+get_ssid() {
+  local dev out ts ssid cache_ip now_s
+  dev=$(wifi_dev); [ -z "$dev" ] && return 0
+  out=$(networksetup -getairportnetwork "$dev" 2>/dev/null)
+  case "$out" in
+    "Current Wi-Fi Network:"*) printf '%s' "${out#Current Wi-Fi Network: }"; return 0 ;;
+  esac
+  # 新版 macOS (CoreWLAN 16+) 对 networksetup 加了定位权限限制，会返回
+  # "You are not associated..."，但实际 Wi-Fi 是连着的，只能退用 system_profiler。
+  # 它单次耗时 2~3 秒，会让认证慢到弹窗后面去，因此缓存结果。
+  # 缓存里同时记下当时的 IP：换了 Wi-Fi 必然换 IP，此时强制重读，避免拿旧 SSID 误判。
+  now_s=$(now)
+  # 缓存文件不存在时不要做 < 重定向：bash 会在 2>/dev/null 生效前就报
+  # "No such file or directory"，污染输出
+  if [ -f "$SSID_CACHE" ]; then
+    IFS=$'\t' read -r ts ssid cache_ip < "$SSID_CACHE"
+  fi
+  if [ -n "$ssid" ] && [ -n "$ts" ] && [ $((now_s - ts)) -lt "$SSID_CACHE_TTL" ] && \
+     { [ -z "$MY_IP" ] || [ "$cache_ip" = "$MY_IP" ]; }; then
+    printf '%s' "$ssid"; return 0
+  fi
+  ssid=$(system_profiler SPAirPortDataType 2>/dev/null | awk '
+    /Current Network Information:/ { getline; sub(/^[[:space:]]+/, ""); sub(/:[[:space:]]*$/, ""); print; exit }')
+  printf '%s\t%s\t%s\n' "$now_s" "$ssid" "${MY_IP:-}" > "$SSID_CACHE" 2>/dev/null
+  printf '%s' "$ssid"
+}
+
+get_ip() {
+  local dev; dev=$(wifi_dev); [ -z "$dev" ] && return 0
+  ipconfig getifaddr "$dev" 2>/dev/null
+}
+
+get_mac() {
+  local dev; dev=$(wifi_dev); [ -z "$dev" ] && return 0
+  networksetup -getmacaddress "$dev" 2>/dev/null | awk '{print $3}'
+}
+
+# ---------- 网络状态三态判定 ----------
+# 返回 0=已认证  1=未认证(网关可达，页面是登录页)  2=网络未就绪(网关连不上/无 IP)
+# 关键：必须把「断网」和「未认证」分开。以前断网也被当作未认证，
+#      会去提交认证（必然 HTTP 000），再累加失败次数进入指数退避；
+#      等网络真恢复了还卡在退避窗口里，看起来就像自动认证失效了十几分钟。
+# Dr.COM 首页是 GBK，先转 UTF-8；判据只用互斥页面标记：
+#   注销页 = _1.htm，上网登录页 = _0.htm
+# 坑：登录页含 `authsuccess='..._3.htm'`，判据里放 Success 会被 grep -i
+#     误命中 authsuccess，导致未认证被判成已联网。
+# 绝不用 captive.apple.com 兜底：本校 CDN 缓存未认证时也返回 Success。
+portal_state() {
+  local body rc
+  body=$(curl "${IFACE_ARGS[@]}" -sS --noproxy '*' -4 --max-time 6 --connect-timeout 3 -A "$UA" "$CHECK_URL" 2>/dev/null)
+  rc=$?
+  [ "$rc" -ne 0 ] && return 2
+  [ -z "$body" ] && return 2
+  body=$(printf '%s' "$body" | iconv -f gbk -t utf-8 2>/dev/null || printf '%s' "$body")
+  if [ -n "$OFFLINE_REGEX" ] && printf '%s' "$body" | grep -Eiq "$OFFLINE_REGEX"; then
+    return 1
+  fi
+  if printf '%s' "$body" | grep -Eiq "$ONLINE_REGEX"; then
+    return 0
+  fi
+  return 1
+}
+
+# 兼容旧调用：只有明确已认证才返回 0
+online() {
+  portal_state
+  [ $? -eq 0 ] && return 0
+  return 1
+}
+
+# Wi-Fi 刚重连 / DHCP 还没发完 IP 时，在本轮内短轮询等网络就绪。
+# macOS 在网络变化后 1~3 秒就会发起 captive 探测并弹出「网络登录页」；
+# 旧逻辑遇到网关不可达就返回、白等下一个兜底周期，弹窗早就出来了。
+# 返回 0=已认证 / 1=未认证(网关可达) / 2=始终未就绪
+# FAST_RECOVERED=1 表示本轮「从不可达恢复到可达」，调用方跳过防抖立刻认证。
+FAST_RECOVERED=0
+portal_state_retry() {
+  local st waited=0 lssid lmatch
+  case "$FAST_POLL_SEC" in ''|*[!0-9]*) FAST_POLL_SEC=2 ;; esac
+  [ "$FAST_POLL_SEC" -lt 1 ] && FAST_POLL_SEC=2
+  case "$FAST_WAIT_SEC" in ''|*[!0-9]*) FAST_WAIT_SEC=15 ;; esac
+  [ "$FAST_WAIT_SEC" -lt 1 ] && return 2
+
+  portal_state; st=$?
+  [ "$st" -ne 2 ] && return "$st"
+
+  # 只有「连的是本校 Wi-Fi」才值得空等；明确不是校园网就直接返回
+  if [ -n "$SSID_MATCH" ] && [ -n "$MY_SSID" ]; then
+    lssid=$(printf '%s' "$MY_SSID" | tr 'A-Z' 'a-z')
+    lmatch=$(printf '%s' "$SSID_MATCH" | tr 'A-Z' 'a-z')
+    case "$lssid" in *"$lmatch"*) ;; *) return 2 ;; esac
+  fi
+
+  while [ "$waited" -lt "$FAST_WAIT_SEC" ]; do
+    sleep "$FAST_POLL_SEC"
+    waited=$((waited + FAST_POLL_SEC))
+    refresh_iface
+    portal_state; st=$?
+    if [ "$st" -ne 2 ]; then
+      FAST_RECOVERED=1
+      return "$st"
+    fi
+  done
+  return 2
+}
+
+esc_sed() { printf '%s' "$1" | sed -e 's/[\/&|\\]/\\&/g'; }
+
+urldecode() {
+  if command -v perl >/dev/null 2>&1; then
+    printf '%s' "$1" | perl -pe 's/%([0-9A-Fa-f]{2})/chr(hex($1))/ge'
+  else
+    printf '%s' "$1"
+  fi
+}
+
+# ---------- 探测 Portal ----------
+PORTAL_URL=""
+discover_portal() {
+  local h b code loc html q
+  h=$(mktemp -t cal_h); b=$(mktemp -t cal_b)
+  curl "${IFACE_ARGS[@]}" -sS --noproxy '*' -4 --max-time 7 --connect-timeout 3 -A "$UA" \
+       -D "$h" -o "$b" "$CHECK_URL" >/dev/null 2>&1
+  code=$(awk 'toupper($1) ~ /^HTTP\// {c=$2} END{print c}' "$h" 2>/dev/null)
+  loc=$(awk 'tolower($1)=="location:" {sub(/^[^:]*:[ \t]*/,""); gsub(/\r/,""); print}' "$h" 2>/dev/null | tail -1)
+  html=$(cat "$b" 2>/dev/null)
+  [ -z "$loc" ] && loc=$(printf '%s' "$html" | LC_ALL=C tr '\n' ' ' | grep -Eio ".{0,80}(location\.href|window\.location).{0,200}" | grep -Eo "https?://[^'\"<> ]+" | head -1)
+  [ -z "$loc" ] && loc=$(printf '%s' "$html" | LC_ALL=C tr '\n' ' ' | grep -Eio "<meta[^>]*refresh[^>]*>" | grep -Eio "url=[^'\"<> ]+" | head -1 | sed -E 's/^[Uu][Rr][Ll]=//')
+  PORTAL_URL="$loc"
+
+  # 解析 query 参数为 key<TAB>value
+  : > "$QUERY_FILE"
+  q=""
+  case "$loc" in *\?*) q="${loc#*\?}" ;; esac
+  QUERY_ALL=""
+  if [ -n "$q" ]; then
+    QUERY_ALL="$q"
+    printf '%s\n' "$q" | tr '&' '\n' | while IFS='=' read -r k v || [ -n "$k" ]; do
+      [ -n "$k" ] && printf '%s\t%s\n' "$k" "$v" >> "$QUERY_FILE"
+    done
+  fi
+
+  # 保存探测报告
+  {
+    printf '时间: %s\n' "$(date '+%F %T')"
+    printf 'HTTP 状态: %s\n' "$code"
+    printf '跳转地址: %s\n' "$loc"
+    printf '\n--- 响应头 ---\n'; cat "$h" 2>/dev/null
+    printf '\n--- 页面片段(前 20KB) ---\n'; printf '%s' "$html" | head -c 20000
+    printf '\n'
+  } > "$PROBE_OUT"
+  rm -f "$h" "$b"
+  [ -n "$PORTAL_URL" ]
+}
+
+query_get() {
+  local v
+  v=$(awk -F'\t' -v k="$1" '$1==k {print $2; exit}' "$QUERY_FILE" 2>/dev/null)
+  [ -n "$v" ] && urldecode "$v"
+}
+
+# 从 Portal 页面解析 <form> 的 action 与 input 字段
+parse_form() {
+  local page action
+  page=$(mktemp -t cal_p)
+  curl "${IFACE_ARGS[@]}" -sS --noproxy '*' -4 --max-time 8 --connect-timeout 3 -A "$UA" \
+       -b "$JAR" -c "$JAR" "$1" 2>/dev/null | LC_ALL=C tr '\n' ' ' > "$page"
+  action=$(grep -Eio '<form[^>]*>' "$page" | head -1 | grep -Eio 'action="[^"]*"' | sed 's/.*="//;s/"$//')
+  [ -z "$action" ] && action=$(grep -Eio '<form[^>]*>' "$page" | head -1 | grep -Eio "action='[^']*'" | sed "s/.*='//;s/'$//")
+  : > "$FIELDS_FILE"
+  grep -Eio '<input[^>]*>' "$page" | while IFS= read -r tag; do
+    local n v low
+    n=$(printf '%s' "$tag" | grep -Eio 'name="[^"]*"' | head -1 | sed 's/.*="//;s/"$//')
+    [ -z "$n" ] && n=$(printf '%s' "$tag" | grep -Eio "name='[^']*'" | head -1 | sed "s/.*='//;s/'$//")
+    [ -z "$n" ] && continue
+    v=$(printf '%s' "$tag" | grep -Eio 'value="[^"]*"' | head -1 | sed 's/.*="//;s/"$//')
+    low=$(printf '%s' "$n" | tr 'A-Z' 'a-z')
+    # 只写占位符，绝不让明文密码落盘；运行时由 render() 展开
+    case "$low" in
+      username|user|userid|user_id|account|acct|uname|loginname|login_name|ddddd|usr) v='{{USER}}' ;;
+      password|passwd|pass|pwd|upass|userpassword|user_password) v='{{PASS}}' ;;
+    esac
+    printf '%s=%s\n' "$n" "$v" >> "$FIELDS_FILE"
+  done
+  rm -f "$page"
+  printf '%s' "$action"
+}
+
+join_url() {
+  local base="$1" rel="$2" origin rest dir
+  case "$rel" in
+    http://*|https://*) printf '%s' "$rel"; return ;;
+  esac
+  origin=$(printf '%s' "$base" | sed -E 's#(https?://[^/]+).*#\1#')
+  rest="${base#"$origin"}"; rest="${rest%%\?*}"; dir="${rest%/*}"
+  case "$rel" in
+    /*) printf '%s%s' "$origin" "$rel" ;;
+    *)  printf '%s%s/%s' "$origin" "$dir" "$rel" ;;
+  esac
+}
+
+# ---------- 渲染模板 ----------
+MY_IP=""; MY_SSID=""; MY_MAC=""; TS=""; QUERY_ALL=""
+render() {
+  local s="$1" pat v full_user
+  full_user="${USERNAME}${ACCOUNT_SUFFIX}"
+  s="${s//\{\{USER\}\}/$full_user}"
+  s="${s//\{\{PASS\}\}/$PASSWORD}"
+  s="${s//\{\{IP\}\}/$MY_IP}"
+  s="${s//\{\{SSID\}\}/$MY_SSID}"
+  s="${s//\{\{MAC\}\}/$MY_MAC}"
+  s="${s//\{\{TS\}\}/$TS}"
+  s="${s//\{\{PORTAL_URL\}\}/$PORTAL_URL}"
+  s="${s//\{\{QUERY_ALL\}\}/$QUERY_ALL}"
+  while [[ "$s" =~ \{\{QUERY:([A-Za-z0-9_]+)\}\} ]]; do
+    pat="{{QUERY:${BASH_REMATCH[1]}}}"
+    v=$(query_get "${BASH_REMATCH[1]}")
+    s="${s//"$pat"/$v}"
+  done
+  printf '%s' "$s"
+}
+
+build_fields() {
+  local src="$1" out="$2" line key val dyn
+  : > "$out"
+  while IFS= read -r line || [ -n "$line" ]; do
+    [ -z "$line" ] && continue
+    line=$(render "$line")
+    key="${line%%=*}"; val="${line#*=}"
+    # 常见动态参数用本次探测到的最新值覆盖
+    case ",$DYNAMIC_FIELDS," in
+      *",$key,"*) dyn=$(query_get "$key"); [ -n "$dyn" ] && val="$dyn" ;;
+    esac
+    printf '%s=%s\n' "$key" "$val" >> "$out"
+  done < "$src"
+}
+
+# ---------- 核心：一次认证 ----------
+cmd_login() {
+  load_config
+  rotate_log
+  # get_ip 必须在 get_ssid 之前：SSID 缓存用 IP 变化判断「是否换了 Wi-Fi」
+  MY_IP=$(get_ip); MY_SSID=$(get_ssid); TS=$(now)
+  MY_MAC=""
+  case "$LOGIN_URL$POST_FIELDS" in *'{{MAC}}'*) MY_MAC=$(get_mac) ;; esac
+
+  if [ -z "$USERNAME" ] || [ -z "$PASSWORD" ]; then
+    exit 0   # 未配置凭据，静默跳过，不刷日志
+  fi
+  if [ -n "$SSID_MATCH" ] && [ -n "$MY_SSID" ]; then
+    local lssid lmatch
+    lssid=$(printf '%s' "$MY_SSID" | tr 'A-Z' 'a-z')
+    lmatch=$(printf '%s' "$SSID_MATCH" | tr 'A-Z' 'a-z')
+    case "$lssid" in *"$lmatch"*) ;; *) exit 0 ;; esac
+  fi
+  # MY_SSID 为空（权限限制读不到）时不过滤：
+  # 是否发起认证交给 online() 的校园网网关注销页判据决定，
+  # 避免因 SSID 读取失败导致自动认证永远不触发。
+
+  # 刷新接口绑定：脚本启动那一刻 Wi-Fi 可能还没拿到 IP，
+  # 顶层就不会加 --interface，请求改走默认路由（iPhone 热点）→ 连不上 Portal。
+  refresh_iface
+
+  # 顺序很关键：先判网络状态，再谈退避。
+  # 以前退避检查在最前面，网络恢复后仍卡在退避窗口里，十几分钟不认证。
+  local st
+  portal_state_retry
+  st=$?
+  case "$st" in
+    0)
+      printf '0' > "$FAIL_COUNT"
+      rm -f "$LAST_TRY"
+      log "已联网，跳过 (SSID=$MY_SSID IP=$MY_IP)"
+      exit 0 ;;
+    2)
+      # 断网 / Wi-Fi 刚重连 / DHCP 未就绪：不是「未认证」，
+      # 不提交认证、不累加失败、清空退避，网络一恢复下次触发立刻认证
+      printf '0' > "$FAIL_COUNT"
+      rm -f "$LAST_TRY"
+      log "网络未就绪：校园网网关不可达 (SSID=$MY_SSID IP=$MY_IP)，等待下次触发"
+      exit 0 ;;
+  esac
+
+  # 到这里才是真正「网关可达但未认证」
+  local last fails backoff
+  last=$(cat "$LAST_TRY" 2>/dev/null); last=${last:-0}
+  fails=$(cat "$FAIL_COUNT" 2>/dev/null); fails=${fails:-0}
+  backoff=$DEBOUNCE_SEC
+  if [ "$FAST_RECOVERED" = "1" ]; then
+    # 网络刚刚恢复：抢在系统弹出登录页之前提交，不受常规防抖/失败退避限制
+    backoff=0
+    fails=0
+    printf '0' > "$FAIL_COUNT"
+    log "网络刚恢复，跳过防抖立即认证"
+  fi
+  local i=0
+  while [ "$i" -lt "$fails" ] && [ "$backoff" -lt "$MAX_BACKOFF" ]; do backoff=$((backoff*2)); i=$((i+1)); done
+  [ "$backoff" -gt "$MAX_BACKOFF" ] && backoff=$MAX_BACKOFF
+  [ $((TS - last)) -lt "$backoff" ] && exit 0
+  printf '%s' "$TS" > "$LAST_TRY"
+
+  log "检测到未认证 (SSID=$MY_SSID IP=$MY_IP)，开始处理"
+  PORTAL_URL=""
+  if [ -n "$LOGIN_URL" ] && [ -n "$POST_FIELDS" ] && \
+     ! printf '%s%s' "$LOGIN_URL" "$POST_FIELDS" | grep -Eq '\{\{QUERY|\{\{PORTAL_URL\}\}'; then
+    # 固定接口已配好，不需要抓 302 跳转；省掉一次最多 7 秒的 HTTP 往返，
+    # 让认证在连上 Wi-Fi 后 1 秒内完成，抢在系统弹出登录页之前。
+    log "固定接口，跳过 Portal 探测（极速认证）"
+  elif discover_portal; then
+    log "Portal: $PORTAL_URL"
+  elif [ -z "$LOGIN_URL" ]; then
+    log "警告: 未抓到 Portal 跳转地址，将尝试自动解析表单"
+  fi
+
+  local fields url action resp_h resp_b
+  fields=$(mktemp -t cal_f); resp_h=$(mktemp -t cal_rh); resp_b=$(mktemp -t cal_rb)
+  url="$LOGIN_URL"
+
+  if [ -n "$POST_FIELDS" ]; then
+    printf '%s\n' "$POST_FIELDS" | tr '&' '\n' > "$STATE_DIR/fields.raw"
+    build_fields "$STATE_DIR/fields.raw" "$fields"
+  else
+    # 零配置模式：自动解析 Portal 表单
+    action=""
+    [ -n "$PORTAL_URL" ] && action=$(parse_form "$PORTAL_URL")
+    if [ -n "$action" ]; then
+      url=$(join_url "$PORTAL_URL" "$action")
+      log "自动发现表单: $url"
+    elif [ -n "$PORTAL_URL" ]; then
+      url=$(join_url "$PORTAL_URL" "/")
+      cp "$FIELDS_FILE" "$fields"
+    fi
+    build_fields "$FIELDS_FILE" "$fields"
+  fi
+
+  [ -z "$url" ] && url="$PORTAL_URL"
+  if [ -z "$url" ] || [ ! -s "$fields" ]; then
+    log "失败: 缺少登录地址或提交字段。请运行 'campus-autologin probe' 或 'import-curl' 配置"
+    printf '%s' "$((fails+1))" > "$FAIL_COUNT"
+    rm -f "$fields" "$resp_h" "$resp_b"
+    exit 1
+  fi
+
+  url=$(render "$url")
+
+  # 预取 Portal 页面拿会话 Cookie（锐捷/深澜依赖 JSESSIONID）
+  if [ "$PREGET" = "1" ] && [ -n "$PORTAL_URL" ]; then
+    curl "${IFACE_ARGS[@]}" -sS --noproxy '*' -4 --max-time 8 --connect-timeout 3 -A "$UA" \
+         -b "$JAR" -c "$JAR" "$PORTAL_URL" -o /dev/null 2>/dev/null
+  fi
+
+  local args=()
+  args=( "${IFACE_ARGS[@]}" -sS --noproxy '*' -4 --max-time 15 --connect-timeout 4 -A "$UA"
+         -H "Content-Type: application/x-www-form-urlencoded; charset=UTF-8" )
+  [ -f "$JAR" ] && args+=( -b "$JAR" -c "$JAR" )
+  if [ -f "$HEADERS_FILE" ]; then
+    while IFS= read -r h; do [ -n "$h" ] && args+=( -H "$(render "$h")" ); done < "$HEADERS_FILE"
+  fi
+  [ -n "$PORTAL_URL" ] && args+=( -e "$PORTAL_URL" )
+  [ "$LOGIN_METHOD" = "GET" ] && args+=( -G )
+  while IFS= read -r pair; do
+    [ -n "$pair" ] && args+=( --data-urlencode "$pair" )
+  done < "$fields"
+  args+=( -D "$resp_h" -o "$resp_b" -w '%{http_code}' "$url" )
+
+  local code
+  code=$(curl "${args[@]}" 2>/dev/null)
+  local body; body=$(head -c 1500 "$resp_b" 2>/dev/null | LC_ALL=C tr '\n' ' ')
+  log "提交 $LOGIN_METHOD $url (HTTP ${code:-000})"
+
+  sleep 1
+  if online; then
+    printf '0' > "$FAIL_COUNT"
+    log "认证成功 已恢复联网"
+    post_auth_cleanup
+    rm -f "$fields" "$resp_h" "$resp_b"
+    exit 0
+  fi
+  # 服务端回「已经在线」(ret_code:2)：凭据有效且无需重复认证，按成功处理，
+  # 否则会被当成失败并触发退避，日志里刷无意义的报错
+  if printf '%s' "$body" | grep -Eiq '已经在线|already online|ret_code"?[: ]*2'; then
+    printf '0' > "$FAIL_COUNT"
+    log "服务端确认已在线（无需重复认证），响应: $body"
+    post_auth_cleanup
+    rm -f "$fields" "$resp_h" "$resp_b"
+    exit 0
+  fi
+  if printf '%s' "$body" | grep -Eiq "$SUCCESS_REGEX"; then
+    log "服务端返回成功标志，但外网仍不通（可能延迟），响应: $body"
+  else
+    log "认证未生效，响应: $body"
+  fi
+  printf '%s' "$((fails+1))" > "$FAIL_COUNT"
+  rm -f "$fields" "$resp_h" "$resp_b"
+  exit 1
+}
+
+# ---------- 抓取 Portal 信息 ----------
+cmd_probe() {
+  load_config
+  MY_SSID=$(get_ssid); MY_IP=$(get_ip)
+  printf '当前 SSID : %s\n本机 IP   : %s\n\n' "${MY_SSID:-<无 Wi-Fi>}" "${MY_IP:-<无>}"
+  if online; then
+    printf '注意: 当前已联网，抓不到 Portal 跳转。\n'
+    printf '请先在浏览器里断开认证（或重连校园网），再运行本命令。\n'
+    printf '\n也可以直接用浏览器 F12 → 网络 → 复制为 cURL → 运行 import-curl。\n'
+    return 0
+  fi
+  printf '正在探测 Portal ...\n\n'
+  if discover_portal; then
+    printf '跳转地址:\n  %s\n\n' "$PORTAL_URL"
+    printf 'URL 参数:\n'
+    awk -F'\t' '{printf "  %-24s = %s\n", $1, $2}' "$QUERY_FILE"
+    printf '\n'
+    local action
+    action=$(parse_form "$PORTAL_URL")
+    printf '表单 action: %s\n表单字段:\n' "${action:-<未发现>}"
+    sed 's/^/  /' "$FIELDS_FILE"
+    printf '\n完整报告: %s\n' "$PROBE_OUT"
+    printf '\n下一步（推荐）:\n'
+    printf '  1) 浏览器打开 Portal，F12 → 网络 → 登录一次 → 右键 InterFace.do?method=login → 复制为 cURL\n'
+    printf '  2) campus-autologin import-curl   （粘贴后 Ctrl-D）\n'
+    printf '  3) campus-autologin set-cred\n'
+    printf '  4) campus-autologin install\n'
+  else
+    printf '未抓到跳转地址。查看报告: %s\n' "$PROBE_OUT"
+  fi
+}
+
+# ---------- 导入浏览器复制的 cURL ----------
+cmd_import_curl() {
+  load_config
+  local src="${1:-}" raw url data
+  if [ -n "$src" ] && [ -f "$src" ]; then
+    raw=$(cat "$src")
+  else
+    printf '粘贴浏览器复制的 cURL 命令（可多行），结束后按 Ctrl-D：\n'
+    raw=$(cat)
+  fi
+  [ -z "$raw" ] && { printf '没有输入内容\n'; return 1; }
+  raw=$(printf '%s' "$raw" | tr $'\\\n' '  ')
+
+  url=$(printf '%s' "$raw" | sed -En "s|.*curl[[:space:]]*['\"](https?://[^'\"]+)['\"].*|\1|p" | head -1)
+  data=$(printf '%s' "$raw" | grep -Eo -- "(--data-raw|--data-binary|--data-urlencode|--data|-d)[[:space:]]+('[^']*'|\"[^\"]*\")" | head -1 | sed -E "s/^[^[:space:]]+[[:space:]]+['\"]//; s/['\"]$//")
+  printf '%s' "$raw" | grep -Eo -- "-H[[:space:]]+('[^']*'|\"[^\"]*\")" | sed -E "s/^-H[[:space:]]+['\"]//; s/['\"]$//" | grep -Ev '^(Content-Length|Host|Accept-Encoding|Connection|User-Agent):' > "$HEADERS_FILE"
+
+  [ -z "$url" ] && { printf '没解析出 URL。请确认粘贴的是 curl 命令本身。\n'; return 1; }
+
+  # 账号密码脱敏为占位符：即使还没配置凭据，也不让明文密码落盘
+  local ph_u='{{USER}}' ph_p='{{PASS}}' item key lowkey val full_user
+  full_user="${USERNAME}${ACCOUNT_SUFFIX}"
+  [ -n "$full_user" ] && data="${data//$full_user/$ph_u}"
+  [ -n "$ACCOUNT_SUFFIX" ] && data="${data//${USERNAME}%40${ACCOUNT_SUFFIX#@}/$ph_u}"
+  [ -n "$USERNAME" ] && data="${data//$USERNAME/$ph_u}"
+  [ -n "$PASSWORD" ] && data="${data//$PASSWORD/$ph_p}"
+  printf '%s\n' "$data" | tr '&' '\n' | while IFS= read -r item; do
+    [ -z "$item" ] && continue
+    key="${item%%=*}"; val="${item#*=}"
+    lowkey=$(printf '%s' "$key" | tr 'A-Z' 'a-z')
+    case "$lowkey" in
+      *encrypt*|*type*|*flag*|*mode*|*hint*) ;;
+      *password*|*passwd*|*pass*|*pwd*) val="$ph_p" ;;
+    esac
+    printf '%s=%s\n' "$key" "$val"
+  done > "$STATE_DIR/import.fields"
+  [ -s "$STATE_DIR/import.fields" ] && data=$(paste -s -d '&' "$STATE_DIR/import.fields")
+
+  {
+    printf '# 由 import-curl 于 %s 生成；此文件优先级高于 config.env\n' "$(date '+%F %T')"
+    printf 'LOGIN_URL="%s"\n' "$url"
+    printf 'LOGIN_METHOD="POST"\n'
+    printf 'POST_FIELDS="%s"\n' "$data"
+  } > "$IMPORTED"
+
+  printf '\n已生成配置 %s\n' "$IMPORTED"
+  printf '  登录地址 : %s\n' "$url"
+  printf '  提交字段 : %s\n' "${data:-<未发现 --data，请手动补 POST_FIELDS>}"
+  printf '  额外请求头: %s 行（已写入 %s）\n' "$(wc -l < "$HEADERS_FILE" | tr -d ' ')" "$HEADERS_FILE"
+  printf '\n检查要点:\n'
+  printf '  · 账号密码应显示为 {{USER}} / {{PASS}}；若不是，先跑 set-cred 再重新导入，或手改 imported.env\n'
+  printf '  · 若密码字段是加密串（passwordEncrypt=true），需把该字段改回 {{PASS}} 并设 passwordEncrypt=false\n'
+  printf '  · queryString 等动态参数会在运行时用本次探测到的值自动覆盖\n'
+  printf '\n跑一次验证: campus-autologin login\n'
+}
+
+# ---------- 凭据 ----------
+cmd_setcred() {
+  load_config
+  local acct pass
+  printf '校园网账号 [%s]: ' "${USERNAME:-}"; IFS= read -r acct
+  [ -z "$acct" ] && acct="$USERNAME"
+  [ -z "$acct" ] && { printf '账号不能为空\n'; return 1; }
+  printf '密码（输入不回显）: '; IFS= read -rs pass; printf '\n'
+  [ -z "$pass" ] && { printf '密码不能为空\n'; return 1; }
+  security add-generic-password -U -a "$acct" -s "$KC_SERVICE" -w "$pass" >/dev/null 2>&1 || {
+    printf '写入钥匙串失败（若钥匙串被锁定，请先解锁）\n'; return 1; }
+  if grep -q '^USERNAME=' "$CONFIG" 2>/dev/null; then
+    sed -i '' "s|^USERNAME=.*|USERNAME=\"$(esc_sed "$acct")\"|" "$CONFIG"
+  else
+    printf 'USERNAME="%s"\n' "$acct" >> "$CONFIG"
+  fi
+  printf '账号已写入配置，密码已存入 macOS 钥匙串（服务名: %s）\n' "$KC_SERVICE"
+}
+
+# ---------- launchd 守护 ----------
+agent_loaded() {
+  launchctl print "gui/$(id -u)/$AGENT_LABEL" >/dev/null 2>&1 && return 0
+  launchctl list 2>/dev/null | grep -q "$AGENT_LABEL" && return 0
+  return 1
+}
+
+cmd_install() {
+  load_config
+  local self="$HOME/.local/bin/campus-autologin"
+  [ -x "$self" ] || { printf '未找到 %s，请先运行 install.sh 部署脚本\n' "$self"; return 1; }
+  case "$CHECK_INTERVAL" in ''|*[!0-9]*) CHECK_INTERVAL=30 ;; esac
+  [ "$CHECK_INTERVAL" -lt 10 ] && CHECK_INTERVAL=10
+  cat > "$PLIST" <<EOF
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+  <key>Label</key><string>$AGENT_LABEL</string>
+  <key>ProgramArguments</key>
+  <array><string>/bin/bash</string><string>$self</string><string>login</string></array>
+  <key>WatchPaths</key>
+  <array>
+    <string>/var/run/resolv.conf</string>
+    <string>/Library/Preferences/SystemConfiguration/NetworkInterfaces.plist</string>
+    <string>/Library/Preferences/SystemConfiguration/preferences.plist</string>
+    <string>/Library/Preferences/SystemConfiguration/com.apple.airport.preferences.plist</string>
+  </array>
+  <key>StartInterval</key><integer>$CHECK_INTERVAL</integer>
+  <key>RunAtLoad</key><true/>
+  <key>ProcessType</key><string>Background</string>
+  <key>LowPriorityIO</key><true/>
+  <key>StandardOutPath</key><string>$LOGDIR/campus-autologin.launchd.log</string>
+  <key>StandardErrorPath</key><string>$LOGDIR/campus-autologin.launchd.log</string>
+</dict>
+</plist>
+EOF
+  plutil -lint "$PLIST" >/dev/null 2>&1 || { printf 'plist 格式错误\n'; return 1; }
+  # 守护已经在跑时绝不做 bootout：非 GUI 会话（如 WorkBuddy）里 bootstrap 会被拒，
+  # 一旦移除就再也挂不回去，反而把正常工作的开机自启弄丢。
+  if agent_loaded; then
+    printf '守护已在运行，plist 已更新（重启/重新登录后自动使用新配置）\n'
+    printf '如需立即重载: launchctl kickstart -k gui/%s/%s\n' "$(id -u)" "$AGENT_LABEL"
+  else
+    launchctl enable "gui/$(id -u)/$AGENT_LABEL" >/dev/null 2>&1
+    if ! launchctl bootstrap "gui/$(id -u)" "$PLIST" >/dev/null 2>&1; then
+      launchctl load -w "$PLIST" >/dev/null 2>&1
+    fi
+  fi
+  printf '配置已写入: %s\n' "$PLIST"
+  if agent_loaded; then
+    printf '   守护运行中：网络变化即时触发 + 每 %s 秒兜底检测\n' "$CHECK_INTERVAL"
+  else
+    printf '\n注意: 当前会话无法向 launchd 注册任务（沙箱 / 非登录终端常见），plist 本身没问题。\n'
+    printf '   在「终端.app」里执行一次即可生效:\n     %s install\n' "$self"
+    printf '   或注销后重新登录（系统会自动加载 LaunchAgents）。\n'
+    printf '   临时替代: %s watch   （前台常驻，Ctrl-C 退出）\n' "$self"
+  fi
+  if [ -z "$USERNAME" ] || [ -z "$PASSWORD" ]; then
+    printf '\n注意: 还没配置账号密码，守护会静默待命。执行:\n   %s set-cred\n' "$self"
+  fi
+  printf '\n查看状态: %s status\n' "$self"
+}
+
+cmd_watch() {
+  load_config
+  printf '常驻监听中：网络配置变化即时检测 + 每 30 秒兜底，Ctrl-C 退出。\n'
+  printf '守护状态: %s ｜ 账号: %s\n' "$(agent_loaded && echo 已加载 || echo 未加载)" "${USERNAME:-<未设置>}"
+  local last_m="" m
+  while true; do
+    m=$(stat -f %m /var/run/resolv.conf 2>/dev/null || printf '0')
+    if [ "$m" != "$last_m" ]; then
+      last_m="$m"
+      "$SELF_PATH" login >/dev/null 2>&1
+    fi
+    sleep 30
+    "$SELF_PATH" login >/dev/null 2>&1
+  done
+}
+
+cmd_uninstall() {
+  launchctl bootout "gui/$(id -u)/$AGENT_LABEL" >/dev/null 2>&1
+  launchctl unload -w "$PLIST" >/dev/null 2>&1
+  rm -f "$PLIST"
+  printf '守护已卸载（配置与凭据保留）\n'
+}
+
+# ---------- 关闭 macOS 自动弹出的 Portal 登录页 ----------
+# 连上需要认证的 Wi-Fi 时，macOS 会探测 captive.apple.com，发现不是
+# Success 就弹「网络登录页」；浏览器打开的 HTTP 页面也可能被 AC 302 到 Portal。
+# 两层办法：
+#   1) 极速认证（portal_state_retry）—— 网络一就绪几秒内就把认证做完，
+#      这是主力，免任何管理员权限，弹窗来不及出现 / 出现后也会自动收起；
+#   2) 关掉 Captive Network Assistant 的 Active 开关（本命令）——
+#      系统级 plist 由 root 守护 /usr/libexec/captiveagent 读取，需要管理员。
+# 注意：macOS 27 的 captiveagent 已改版，Active 开关不保证仍被读取，
+#       所以这层是保险，不是唯一依赖。
+cna_disabled() {
+  local v
+  v=$(defaults read "$CNA_sys" Active 2>/dev/null); [ "$v" = "0" ] && return 0
+  v=$(defaults read "$CNA_user" Active 2>/dev/null); [ "$v" = "0" ] && return 0
+  return 1
+}
+
+# ---------- 收掉连 Wi-Fi 瞬间弹出的登录页 ----------
+# 根因：macOS 27 的 captiveagent 在 Wi-Fi 刚关联、DHCP 还没发完 IP 时就做探测，
+# 那一两秒 AC 会拦截/重定向 HTTP → 系统判定「有 Portal」→ 弹窗或让浏览器开登录页。
+# 我们随后几秒内自动认证成功，但已经弹出来的窗口/标签页不会自己消失，
+# 于是看起来像「明明已经登录了还跳认证页」。
+# 新版 captiveagent 读 com.apple.SystemConfiguration.CaptiveNetworkSupport，
+# 二进制里已没有 Active/Disable 开关，老的 com.apple.captive.control 无效。
+close_cna_window() {
+  # Captive Network Assistant.app 是当前用户态进程，可直接收掉
+  if pgrep -f "Captive Network Assistant" >/dev/null 2>&1; then
+    killall "Captive Network Assistant" >/dev/null 2>&1 && return 0
+  fi
+  return 1
+}
+
+close_portal_tabs() {
+  # 尽力而为：没有自动化授权时 osascript 会失败，静默跳过不报错
+  # CAL_SKIP_BROWSER=1 可跳过浏览器部分（无 GUI 会话 / 自动化测试时用）
+  local n=0
+  [ -n "$CAL_SKIP_BROWSER" ] && { printf '0'; return 0; }
+  if pgrep -f "Google Chrome.app/Contents/MacOS/Google Chrome" >/dev/null 2>&1; then
+    osascript <<'AS' >/dev/null 2>&1 && n=$((n+1))
+tell application "Google Chrome"
+  repeat with w in windows
+    repeat with t in tabs of w
+      try
+        if (URL of t contains "10.17.8.18") or (URL of t contains "eportal") then close t
+      end try
+    end repeat
+  end repeat
+end tell
+AS
+  fi
+  if pgrep -x "Safari" >/dev/null 2>&1; then
+    osascript <<'AS' >/dev/null 2>&1 && n=$((n+1))
+tell application "Safari"
+  repeat with w in windows
+    repeat with t in tabs of w
+      try
+        if (URL of t contains "10.17.8.18") or (URL of t contains "eportal") then close t
+      end try
+    end repeat
+  end repeat
+end tell
+AS
+  fi
+  printf '%s' "$n"
+}
+
+cmd_close_popup() {
+  printf '收掉连 Wi-Fi 时弹出的登录页...\n'
+  if close_cna_window; then
+    printf '  [OK] 系统「网络登录页」窗口已关闭\n'
+  else
+    printf '  [--] 当前没有系统登录页窗口\n'
+  fi
+  local n
+  n=$(close_portal_tabs)
+  if [ "$n" -gt 0 ]; then
+    printf '  [OK] 浏览器里的 Portal 标签页已清理（Chrome / Safari）\n'
+  else
+    printf '  [--] 浏览器未运行，或尚未授权自动化（首次会弹授权框，点「好」即可）\n'
+  fi
+  printf '\n这个动作只收「已经弹出来」的窗口；认证成功后守护会自动做一次。\n'
+  printf 'macOS 27 已无法彻底禁止探测，只能认证成功后立即收起。\n'
+  printf '想让浏览器标签页也自动收：先手动跑一次本命令完成授权，再把配置里的\n'
+  printf 'CLOSE_BROWSER_TABS 改成 1。\n'
+}
+
+# 认证成功后调用：立刻收掉认证完成前那几秒弹出来的登录页
+post_auth_cleanup() {
+  close_cna_window && log "已收起连 Wi-Fi 时弹出的登录页窗口"
+  if [ "$CLOSE_BROWSER_TABS" = "1" ]; then
+    close_portal_tabs >/dev/null 2>&1 &
+  fi
+}
+
+cmd_no_popup() {
+  printf '关于「连上校园网自动弹登录页」——实测结论（macOS 27）：\n\n'
+  printf '  captiveagent 读的是 com.apple.SystemConfiguration.CaptiveNetworkSupport，\n'
+  printf '  二进制里已经没有 Active/Disable 开关。老的 com.apple.captive.control\n'
+  printf '  Active=false 用户级+系统级都写了也不会生效（本机两层都写了，仍然弹）。\n'
+  printf '  这个开关只在老版 macOS 有效，且写入后还需要重启才可能被读取。\n\n'
+  printf '本工具现在靠两层对付它：\n'
+  printf '  1) 极速认证：DHCP 一通立刻提交，把弹窗窗口压到最短\n'
+  printf '  2) 认证成功后自动收起已弹出的窗口（守护每次认证成功都会做）\n\n'
+  defaults write "$CNA_user" Active -bool false >/dev/null 2>&1
+  printf '兼容处理：用户级老开关已写入（无害，但别指望它生效）。\n'
+  printf '系统级老开关：%s\n' "$(cna_disabled && echo '已写入' || echo '未写入')"
+  printf '\n现在就收掉已经弹出来的窗口：campus-autologin close-popup\n'
+  printf '浏览器里的登录页标签页：先跑一次 close-popup 完成自动化授权，\n'
+  printf '再把配置里的 CLOSE_BROWSER_TABS 改成 1，以后会自动收。\n'
+  printf '\n浏览器侧建议：主页/常用站点一律用 HTTPS，并关掉「启动时恢复上次标签页」，\n'
+  printf '这样认证前那两秒就不会有 HTTP 请求被 AC 302 成登录页标签。\n'
+  return 0
+}
+
+cmd_popup_on() {
+  defaults delete "$CNA_user" Active 2>/dev/null
+  if sudo -n defaults delete "$CNA_sys" Active >/dev/null 2>&1; then
+    printf '已恢复系统默认的登录页弹窗。\n'
+  else
+    printf '用户级开关已清除。系统级恢复请在终端.app 执行：\n'
+    printf '  sudo defaults delete /Library/Preferences/SystemConfiguration/com.apple.captive.control Active\n'
+  fi
+}
+
+cmd_status() {
+  load_config
+  local loaded="未加载" st
+  MY_IP=$(get_ip)
+  agent_loaded && loaded="运行中"
+  printf '守护进程 : %s\n' "$loaded"
+  printf '当前 SSID: %s\n' "$(get_ssid)"
+  printf '本机 IP  : %s\n' "$(get_ip)"
+  portal_state
+  st=$?
+  case "$st" in
+    0) printf '网络状态 : 已联网\n' ;;
+    1) printf '网络状态 : 未认证（网关可达）\n' ;;
+    2) printf '网络状态 : 网络未就绪（网关不可达）\n' ;;
+  esac
+  printf '账号     : %s\n' "${USERNAME:-<未设置>}${USERNAME:+$ACCOUNT_SUFFIX}"
+  printf '密码     : %s\n' "$( [ -n "$PASSWORD" ] && echo '已存钥匙串' || echo '<未设置>' )"
+  printf '提交方式 : %s\n' "$LOGIN_METHOD"
+  printf '登录地址 : %s\n' "${LOGIN_URL:-<自动发现>}"
+  printf '提交字段 : %s\n' "$( [ -n "$POST_FIELDS" ] && echo '已配置' || echo '<自动解析表单>' )"
+  printf 'SSID 过滤: %s\n' "${SSID_MATCH:-<不限>}"
+  printf '在线判据 : %s\n' "$CHECK_URL"
+  printf '检测周期 : 每 %s 秒 + 网络变化即时触发\n' "$CHECK_INTERVAL"
+  printf '弹窗处理 : %s\n' "极速认证 + 成功后自动收起$( [ "$CLOSE_BROWSER_TABS" = "1" ] && printf '（含浏览器标签页）' )"
+  printf '老开关   : %s（macOS 27 已失效，仅兼容保留）\n' "$(cna_disabled && echo '已写入' || echo '未写入')"
+  printf '日志     : %s (%s 行)\n' "$LOG" "$(wc -l < "$LOG" 2>/dev/null | tr -d ' ')"
+  printf '配置     : %s\n' "$CONFIG"
+  [ -f "$IMPORTED" ] && printf '导入配置 : %s (优先生效)\n' "$IMPORTED"
+  printf '\n最近日志:\n'
+  if [ -f "$LOG" ]; then
+    tail -n 8 "$LOG" 2>/dev/null | sed 's/^/  /'
+  else
+    printf '  <暂无>\n'
+  fi
+}
+
+# ---------- 开机自启自检 / 自动修复 ----------
+# 用法: autostart [--check]   默认自动修复能修的项；--check 只检查
+autostart_item() {
+  local mark="$1"; shift
+  printf '  [%-4s] %s\n' "$mark" "$*"
+}
+
+cmd_autostart() {
+  local mode="${2:---fix}" rc=0 self perm need_write last age rank first fv dev pref
+  printf '=== 校园网自动认证 · 开机自启自检 ===\n\n'
+
+  # 1. 命令行工具
+  self="$HOME/.local/bin/campus-autologin"
+  if [ -x "$self" ] && bash -n "$self" 2>/dev/null; then
+    autostart_item OK "命令行工具可执行、语法正常"
+  elif [ -f "$self" ]; then
+    if [ "$mode" != "--check" ] && chmod +x "$self" 2>/dev/null; then
+      autostart_item 修复 "已补上执行权限"; else
+      autostart_item 失败 "脚本不可执行（chmod +x ${self}）"; rc=1
+    fi
+  else
+    autostart_item 失败 "未部署 ${self}，请运行 install.sh"; rc=1
+  fi
+
+  # 2. 账号与钥匙串（后台守护能不能读密码）
+  load_config
+  if [ -n "$USERNAME" ] && [ -n "$PASSWORD" ]; then
+    autostart_item OK "账号 ${USERNAME}${ACCOUNT_SUFFIX} 与钥匙串密码均可读"
+  else
+    autostart_item 失败 "账号或密码缺失，守护会静默待命（set-cred 补齐）"; rc=1
+  fi
+
+  # 3. LaunchAgent plist
+  need_write=0
+  if [ ! -f "$PLIST" ]; then
+    need_write=1; autostart_item 注意 "plist 不存在"
+  elif ! plutil -lint "$PLIST" >/dev/null 2>&1; then
+    need_write=1; autostart_item 注意 "plist 格式损坏"
+  elif ! plutil -p "$PLIST" 2>/dev/null | grep -q '"RunAtLoad" => true'; then
+    need_write=1; autostart_item 注意 "plist 缺 RunAtLoad（登录不自动跑）"
+  fi
+  perm=$(stat -f '%Lp' "$PLIST" 2>/dev/null)
+  case "$perm" in
+    600|640|644) ;;
+    *)
+      if [ "$mode" != "--check" ]; then
+        chmod 600 "$PLIST" 2>/dev/null && autostart_item 修复 "plist 权限改为 600（launchd 拒绝组/其他人可写的 plist）"
+      else
+        autostart_item 注意 "plist 权限 $perm 需改为 600（launchd 拒绝组/其他人可写）"; rc=1
+      fi
+      ;;
+  esac
+  if [ "$need_write" -eq 1 ]; then
+    if [ "$mode" != "--check" ] && cmd_install >/dev/null 2>&1; then
+      autostart_item 修复 "已重建 LaunchAgent plist（守护在跑时不会卸载）"
+    else
+      autostart_item 失败 "plist 需重建（autostart 或 install）"; rc=1
+    fi
+  else
+    autostart_item OK "plist 完整：RunAtLoad + 每 ${CHECK_INTERVAL:-30} 秒兜底 + 网络变化即时触发"
+  fi
+
+  # 4. 被 launchd 禁用？
+  if launchctl print-disabled "gui/$(id -u)" 2>/dev/null | grep -q "\"$AGENT_LABEL\" => disabled"; then
+    if [ "$mode" != "--check" ] && launchctl enable "gui/$(id -u)/$AGENT_LABEL" >/dev/null 2>&1; then
+      autostart_item 修复 "已清除 launchd 的 disabled 覆盖"
+    else
+      autostart_item 失败 "服务被 launchd 禁用"; rc=1
+    fi
+  else
+    autostart_item OK "launchd 未禁用该服务（enabled）"
+  fi
+
+  # 5. 是否已加载
+  if agent_loaded; then
+    autostart_item OK "守护已加载（登录时系统自动启动）"
+  elif [ "$mode" != "--check" ] && launchctl bootstrap "gui/$(id -u)" "$PLIST" >/dev/null 2>&1; then
+    autostart_item 修复 "已注册守护"
+  else
+    autostart_item 失败 "守护未加载：本会话不在登录 GUI 上下文，双击 一键启用.command 或注销重登即可"; rc=1
+  fi
+
+  # 6. 心跳：日志里最近一次自动检测距今多久
+  last=$(tail -1 "$LOG" 2>/dev/null | awk '{print $1" "$2}')
+  if [ -n "$last" ]; then
+    age=$(( $(now) - $(date -j -f '%Y-%m-%d %H:%M:%S' "$last" +%s 2>/dev/null || printf '0') ))
+    if [ "$age" -ge 0 ] && [ "$age" -lt 150 ]; then
+      autostart_item OK "最近自动检测 ${last}（${age} 秒前），守护确实在跑"
+    else
+      autostart_item 注意 "最近日志停在 ${last}，可能刚重启或刚登录，等约 1 分钟再看"; rc=1
+    fi
+  else
+    autostart_item 注意 "暂无日志，等守护下一次触发"; rc=1
+  fi
+
+  # 7. Wi-Fi 自动加入优先级（开机先连哪个网络，决定守护能不能立刻干活）
+  dev=$(wifi_dev)
+  if [ -n "$dev" ]; then
+    pref=$(networksetup -listpreferredwirelessnetworks "$dev" 2>/dev/null | sed '1d;s/^[[:space:]]*//' | grep -v '^$')
+    rank=$(printf '%s\n' "$pref" | grep -n -i -m1 'JXUST' | cut -d: -f1)
+    # 直接从原始输出第 2 行取名：中文 SSID 经多行变量再 head 会破坏 UTF-8 字节
+    first=$(networksetup -listpreferredwirelessnetworks "$dev" 2>/dev/null | sed -n '2s/^[[:space:]]*//p')
+    if [ -z "$rank" ]; then
+      autostart_item 注意 "首选网络里没找到 JXUST-WLAN，开机不会自动连校园网"; rc=1
+    elif [ "$rank" -eq 1 ]; then
+      autostart_item OK "JXUST-WLAN 是首选网络第 1 位，开机优先自动加入"
+    else
+      # 必须用 ${first}：bash 3.2 会把 $first 后紧跟的中文首字节当成变量名的一部分
+      autostart_item 提示 "JXUST-WLAN 排在首选网络第 $rank 位（第 1 位是「${first}」），开机可能先连到别的 Wi-Fi；可在 系统设置 > Wi-Fi > 高级 > 已知网络 把它拖到最上面"
+    fi
+  fi
+
+  # 8. macOS 的硬限制说明（不算故障）
+  fv=$(fdesetup status 2>/dev/null)
+  case "$fv" in
+    *On*) autostart_item 说明 "FileVault 已开启 → 开机需先登录解锁（自动登录被系统禁用），登录后守护立刻自动运行，无需任何操作" ;;
+    *)    autostart_item 说明 "FileVault 未开启；如再开启「自动登录」，开机进桌面即自动认证" ;;
+  esac
+  autostart_item 说明 "用户级 LaunchAgent 不会显示在 系统设置 > 通用 > 登录项 里，这是正常的"
+
+  printf '\n'
+  if [ "$rc" -eq 0 ]; then
+    printf '结论：开机自启正常，重启登录后会自动连校园网并认证，无需手动操作。\n'
+  else
+    printf '结论：有项目需要留意，见上方 [失败]/[注意] 标记。\n'
+  fi
+  printf '重启后验证：登录后约 1 分钟跑 campus-autologin autostart，或直接 log 看新记录。\n'
+  return "$rc"
+}
+
+# ---------- 入口 ----------
+case "${1:-status}" in
+  login)        cmd_login ;;
+  probe)        cmd_probe ;;
+  import-curl)  shift; cmd_import_curl "$@" ;;
+  set-cred)     cmd_setcred ;;
+  install)      cmd_install ;;
+  autostart)    cmd_autostart "$@" ;;
+  uninstall)    cmd_uninstall ;;
+  no-popup)     cmd_no_popup ;;
+  close-popup)  cmd_close_popup ;;
+  popup-on)     cmd_popup_on ;;
+  watch)        cmd_watch ;;
+  status)       cmd_status ;;
+  log)          tail -n "${2:-30}" -f "$LOG" 2>/dev/null || printf '暂无日志\n' ;;
+  edit)         "${EDITOR:-nano}" "$CONFIG" ;;
+  -h|--help|help) awk '/^#   [a-z]/{sub(/^#   /,""); print; next} /^#/{next} {exit}' "$0" ;;
+  *) printf '未知命令: %s\n可用: login probe import-curl set-cred install autostart uninstall no-popup close-popup popup-on watch status log edit\n' "$1"; exit 1 ;;
+esac

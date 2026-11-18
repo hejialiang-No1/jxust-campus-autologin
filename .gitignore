@@ -1,0 +1,15 @@
+# 私有笔记：含个人一卡通号与明文密码，绝对不要入库
+multi-device/
+
+# macOS
+.DS_Store
+._*
+*.swp
+
+# Windows 运行时生成（账号/密码/日志，不含在仓库里）
+config.json
+cred.bin
+*.log
+
+# 本地覆盖配置（若以后添加）
+config.local.env
